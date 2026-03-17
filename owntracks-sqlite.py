@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sqlite3
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -72,6 +73,11 @@ def ensure_db(conn):
             lon REAL NOT NULL,
             radius_m REAL NOT NULL DEFAULT 300,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+
+        CREATE TABLE IF NOT EXISTS state (
+            key TEXT PRIMARY KEY,
+            value TEXT
         );
     """)
     conn.commit()
@@ -228,6 +234,121 @@ def resolve_place(conn, lat, lon):
     return (best[1], best[2], best[3]) if best else None
 
 
+def get_state(conn):
+    """Get all state key-value pairs as a dict."""
+    rows = conn.execute("SELECT key, value FROM state").fetchall()
+    return {k: v for k, v in rows}
+
+
+def set_state(conn, **kwargs):
+    """Set state values (upsert)."""
+    for k, v in kwargs.items():
+        conn.execute(
+            "INSERT INTO state(key, value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (k, str(v) if v is not None else None),
+        )
+
+
+def run_hook(hook_path, event, place_name=None, lat=None, lon=None, duration_s=None):
+    """Run a hook script with event info passed as environment variables."""
+    if not hook_path:
+        return
+    if not os.path.isfile(hook_path):
+        print(f"Hook not found: {hook_path}", file=sys.stderr)
+        return
+    env = os.environ.copy()
+    env["HOOK_EVENT"] = event
+    if place_name is not None:
+        env["HOOK_PLACE"] = str(place_name)
+    if lat is not None:
+        env["HOOK_LAT"] = f"{lat:.6f}"
+    if lon is not None:
+        env["HOOK_LON"] = f"{lon:.6f}"
+    if duration_s is not None:
+        env["HOOK_DURATION_S"] = str(int(duration_s))
+    try:
+        subprocess.run([hook_path], env=env, timeout=30, check=False)
+    except Exception as e:
+        print(f"Hook error ({event}): {e}", file=sys.stderr)
+
+
+def detect_transition(conn, env):
+    """Compare current stay with stored state, fire hooks on transitions.
+
+    Returns the updated state dict.
+    """
+    arrive_hook = env.get("ARRIVE_HOOK", "")
+    leave_hook = env.get("LEAVE_HOOK", "")
+    new_unknown_hook = env.get("NEW_UNKNOWN_HOOK", "")
+
+    if not any([arrive_hook, leave_hook, new_unknown_hook]):
+        return
+
+    since = int(dt.datetime.now().timestamp()) - 24 * 86400
+    stays = detect_stays(conn, since)
+    if not stays:
+        return
+
+    current = enrich_stay(conn, stays[-1])
+    cur_place_id = current["place_id"]
+    cur_lat = current["lat"]
+    cur_lon = current["lon"]
+    cur_place_name = current["place_name"]
+
+    state = get_state(conn)
+    prev_place_id = state.get("place_id")  # str(int) or None
+    prev_lat = float(state.get("lat") or 0)
+    prev_lon = float(state.get("lon") or 0)
+    prev_place_name = state.get("place_name")
+    prev_duration = state.get("duration_s")
+
+    first_run = "place_id" not in state and "lat" not in state
+
+    if first_run:
+        # First run — just store state, don't fire hooks
+        set_state(conn, place_id=cur_place_id or "", place_name=cur_place_name or "",
+                  lat=cur_lat, lon=cur_lon, duration_s=current.get("duration_s", 0))
+        conn.commit()
+        return
+
+    # Determine if location changed
+    same_known_place = (cur_place_id is not None and prev_place_id
+                        and str(cur_place_id) == str(prev_place_id))
+    same_unknown = (cur_place_id is None and not prev_place_id
+                    and prev_lat and prev_lon
+                    and haversine_m(cur_lat, cur_lon, prev_lat, prev_lon) <= STAY_RADIUS_M)
+
+    if same_known_place or same_unknown:
+        # Still at the same location — just update duration
+        set_state(conn, duration_s=current.get("duration_s", 0))
+        conn.commit()
+        return
+
+    # --- Location changed ---
+
+    # Leave previous location
+    if prev_lat and prev_lon:
+        leave_name = prev_place_name if prev_place_name else None
+        run_hook(leave_hook, "leave", place_name=leave_name,
+                 lat=prev_lat, lon=prev_lon,
+                 duration_s=int(prev_duration) if prev_duration else None)
+
+    # Arrive at new location
+    if cur_place_id is not None:
+        run_hook(arrive_hook, "arrive", place_name=cur_place_name,
+                 lat=cur_lat, lon=cur_lon)
+    else:
+        if not is_ignored(conn, cur_lat, cur_lon):
+            run_hook(new_unknown_hook, "new_unknown",
+                     lat=cur_lat, lon=cur_lon)
+
+    # Update state
+    set_state(conn, place_id=cur_place_id or "", place_name=cur_place_name or "",
+              lat=cur_lat, lon=cur_lon, duration_s=current.get("duration_s", 0))
+    conn.commit()
+
+
 def enrich_stay(conn, stay):
     """Add place info and duration to a stay dict."""
     place = resolve_place(conn, stay["lat"], stay["lon"])
@@ -287,6 +408,8 @@ def cmd_poll(env_path, db_path):
     place = resolve_place(conn, lat, lon)
     place_name = place[1] if place else "unknown"
     print(f"OK ts={ts} place={place_name} lat={lat} lon={lon}")
+
+    detect_transition(conn, env)
     conn.close()
 
 

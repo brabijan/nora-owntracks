@@ -19,6 +19,7 @@ ENV_PATH_DEFAULT = os.path.expanduser("~/.config/openclaw/owntracks.env")
 # Stay detection parameters
 STAY_RADIUS_M = 200       # points within this distance belong to same stay
 STAY_MIN_DURATION_S = 600  # minimum 10 min to count as a stay
+STAY_MAX_ACC_M = 300      # stays where median accuracy exceeds this are auto-ignored
 
 
 def haversine_m(lat1, lon1, lat2, lon2):
@@ -64,7 +65,8 @@ def ensure_db(conn):
             lat REAL NOT NULL,
             lon REAL NOT NULL,
             radius_m REAL NOT NULL DEFAULT 150,
-            purpose TEXT
+            purpose TEXT,
+            group_name TEXT
         );
 
         CREATE TABLE IF NOT EXISTS ignored_locations (
@@ -72,6 +74,7 @@ def ensure_db(conn):
             lat REAL NOT NULL,
             lon REAL NOT NULL,
             radius_m REAL NOT NULL DEFAULT 300,
+            permanent INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
 
@@ -81,6 +84,17 @@ def ensure_db(conn):
         );
     """)
     conn.commit()
+
+    # Migrations for existing databases
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(ignored_locations)").fetchall()}
+    if "permanent" not in cols:
+        conn.execute("ALTER TABLE ignored_locations ADD COLUMN permanent INTEGER NOT NULL DEFAULT 0")
+        conn.commit()
+
+    place_cols = {r[1] for r in conn.execute("PRAGMA table_info(places)").fetchall()}
+    if "group_name" not in place_cols:
+        conn.execute("ALTER TABLE places ADD COLUMN group_name TEXT")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
@@ -214,24 +228,36 @@ def detect_stays(conn, since_ts=0):
     return stays
 
 
-def is_ignored(conn, lat, lon):
-    """Check if location is near any ignored location."""
-    rows = conn.execute("SELECT lat, lon, radius_m FROM ignored_locations").fetchall()
-    for ilat, ilon, radius in rows:
+def is_ignored(conn, lat, lon, stay_start_ts=None):
+    """Check if location is near any ignored location.
+
+    Permanent entries always match.  Non-permanent entries only match if
+    stay_start_ts <= created_at (so future visits resurface).
+    """
+    rows = conn.execute(
+        "SELECT lat, lon, radius_m, permanent, created_at FROM ignored_locations"
+    ).fetchall()
+    for ilat, ilon, radius, permanent, created_at in rows:
         if haversine_m(lat, lon, ilat, ilon) <= radius:
-            return True
+            if permanent:
+                return True
+            if stay_start_ts is None or stay_start_ts <= created_at:
+                return True
     return False
 
 
 def resolve_place(conn, lat, lon):
-    """Find the closest matching place within its radius. Returns (id, name, radius_m) or None."""
-    rows = conn.execute("SELECT id, name, lat, lon, radius_m FROM places").fetchall()
+    """Find the closest matching place within its radius.
+
+    Returns (id, name, radius_m, group_name) or None.
+    """
+    rows = conn.execute("SELECT id, name, lat, lon, radius_m, group_name FROM places").fetchall()
     best = None
-    for pid, name, plat, plon, radius in rows:
+    for pid, name, plat, plon, radius, group_name in rows:
         d = haversine_m(lat, lon, plat, plon)
         if d <= radius and (best is None or d < best[0]):
-            best = (d, pid, name, radius)
-    return (best[1], best[2], best[3]) if best else None
+            best = (d, pid, name, radius, group_name)
+    return (best[1], best[2], best[3], best[4]) if best else None
 
 
 def get_state(conn):
@@ -292,12 +318,14 @@ def detect_transition(conn, env):
 
     current = enrich_stay(conn, stays[-1])
     cur_place_id = current["place_id"]
+    cur_group = current["group_name"]
     cur_lat = current["lat"]
     cur_lon = current["lon"]
     cur_place_name = current["place_name"]
 
     state = get_state(conn)
     prev_place_id = state.get("place_id")  # str(int) or None
+    prev_group = state.get("group_name") or None
     prev_lat = float(state.get("lat") or 0)
     prev_lon = float(state.get("lon") or 0)
     prev_place_name = state.get("place_name")
@@ -308,18 +336,20 @@ def detect_transition(conn, env):
     if first_run:
         # First run — just store state, don't fire hooks
         set_state(conn, place_id=cur_place_id or "", place_name=cur_place_name or "",
+                  group_name=cur_group or "",
                   lat=cur_lat, lon=cur_lon, duration_s=current.get("duration_s", 0))
         conn.commit()
         return
 
     # Determine if location changed
+    same_group = (cur_group and prev_group and cur_group == prev_group)
     same_known_place = (cur_place_id is not None and prev_place_id
                         and str(cur_place_id) == str(prev_place_id))
     same_unknown = (cur_place_id is None and not prev_place_id
                     and prev_lat and prev_lon
                     and haversine_m(cur_lat, cur_lon, prev_lat, prev_lon) <= STAY_RADIUS_M)
 
-    if same_known_place or same_unknown:
+    if same_group or same_known_place or same_unknown:
         # Still at the same location — just update duration
         set_state(conn, duration_s=current.get("duration_s", 0))
         conn.commit()
@@ -339,12 +369,13 @@ def detect_transition(conn, env):
         run_hook(arrive_hook, "arrive", place_name=cur_place_name,
                  lat=cur_lat, lon=cur_lon)
     else:
-        if not is_ignored(conn, cur_lat, cur_lon):
+        if not is_ignored(conn, cur_lat, cur_lon, current["start_ts"]):
             run_hook(new_unknown_hook, "new_unknown",
                      lat=cur_lat, lon=cur_lon)
 
     # Update state
     set_state(conn, place_id=cur_place_id or "", place_name=cur_place_name or "",
+              group_name=cur_group or "",
               lat=cur_lat, lon=cur_lon, duration_s=current.get("duration_s", 0))
     conn.commit()
 
@@ -360,7 +391,39 @@ def enrich_stay(conn, stay):
     stay["duration_s"] = duration_s
     stay["place_id"] = place[0] if place else None
     stay["place_name"] = place[1] if place else None
+    stay["group_name"] = place[3] if place else None
     return stay
+
+
+def merge_grouped_stays(stays):
+    """Merge consecutive stays that belong to the same group into one.
+
+    The merged stay keeps the first stay's start_ts, the last stay's end_ts
+    and is_current, sums point_count, and uses the group_name as place_name.
+    """
+    if not stays:
+        return stays
+    merged = [stays[0].copy()]
+    for s in stays[1:]:
+        prev = merged[-1]
+        prev_key = prev["group_name"] or prev["place_id"]
+        cur_key = s["group_name"] or s["place_id"]
+        if prev_key and cur_key and prev_key == cur_key:
+            prev["end_ts"] = s["end_ts"]
+            prev["is_current"] = s["is_current"]
+            prev["point_count"] += s["point_count"]
+            now_ts = int(dt.datetime.now().timestamp())
+            if prev["is_current"]:
+                prev["duration_s"] = now_ts - prev["start_ts"]
+            else:
+                prev["duration_s"] = prev["end_ts"] - prev["start_ts"]
+        else:
+            merged.append(s.copy())
+    # Use group_name as display name where applicable
+    for s in merged:
+        if s["group_name"]:
+            s["place_name"] = s["group_name"]
+    return merged
 
 
 def fmt_ts(ts):
@@ -425,7 +488,9 @@ def cmd_now(db_path):
         print("No data.")
         return
 
-    current = enrich_stay(conn, stays[-1])
+    stays = [enrich_stay(conn, s) for s in stays]
+    stays = merge_grouped_stays(stays)
+    current = stays[-1]
     name = current["place_name"] or "unnamed"
     start = fmt_ts(current["start_ts"])
     dur = fmt_duration(current["duration_s"])
@@ -452,6 +517,7 @@ def cmd_stays(db_path, days=7):
     since = int(dt.datetime.now().timestamp()) - days * 86400
     stays = detect_stays(conn, since)
     stays = [enrich_stay(conn, s) for s in stays]
+    stays = merge_grouped_stays(stays)
     stays = [s for s in stays if s["duration_s"] >= STAY_MIN_DURATION_S or s["is_current"]]
 
     if not stays:
@@ -477,6 +543,19 @@ def cmd_stays(db_path, days=7):
     conn.close()
 
 
+def stay_median_acc(conn, stay):
+    """Return median GPS accuracy (meters) for points within a stay's time window."""
+    rows = conn.execute(
+        "SELECT acc FROM points WHERE ts >= ? AND ts <= ? AND acc IS NOT NULL",
+        (stay["start_ts"], stay["end_ts"]),
+    ).fetchall()
+    if not rows:
+        return None
+    vals = sorted(r[0] for r in rows)
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
 def get_unnamed_clusters(conn, days=14):
     """Return sorted list of unnamed location clusters."""
     since = int(dt.datetime.now().timestamp()) - days * 86400
@@ -484,7 +563,8 @@ def get_unnamed_clusters(conn, days=14):
     stays = [enrich_stay(conn, s) for s in stays]
 
     unnamed = [s for s in stays if s["place_id"] is None and s["duration_s"] >= STAY_MIN_DURATION_S
-               and not is_ignored(conn, s["lat"], s["lon"])]
+               and not is_ignored(conn, s["lat"], s["lon"], s["start_ts"])
+               and (stay_median_acc(conn, s) or 0) <= STAY_MAX_ACC_M]
 
     clusters = []
     for s in unnamed:
@@ -533,7 +613,7 @@ def cmd_unnamed(db_path, days=14):
     conn.close()
 
 
-def cmd_ignore_unknown(db_path, index, days=14):
+def cmd_ignore_unknown(db_path, index, days=14, permanent=False):
     """Ignore an unnamed location by its number from the unnamed list."""
     conn = sqlite3.connect(db_path)
     ensure_db(conn)
@@ -546,41 +626,46 @@ def cmd_ignore_unknown(db_path, index, days=14):
 
     c = clusters[index - 1]
     conn.execute(
-        "INSERT INTO ignored_locations(lat, lon, radius_m) VALUES(?,?,?)",
-        (c["lat"], c["lon"], STAY_RADIUS_M),
+        "INSERT INTO ignored_locations(lat, lon, radius_m, permanent) VALUES(?,?,?,?)",
+        (c["lat"], c["lon"], STAY_RADIUS_M, 1 if permanent else 0),
     )
     conn.commit()
     addr = reverse_geocode(c["lat"], c["lon"])
     loc = addr if addr else f"{c['lat']:.6f}, {c['lon']:.6f}"
-    print(f"Ignored: {loc}")
+    label = "Permanently ignored" if permanent else "Ignored (current visits)"
+    print(f"{label}: {loc}")
     conn.close()
 
 
-def cmd_add_place(db_path, name, lat, lon, radius_m, purpose):
+def cmd_add_place(db_path, name, lat, lon, radius_m, purpose, group_name=None):
     conn = sqlite3.connect(db_path)
     ensure_db(conn)
     conn.execute(
-        "INSERT INTO places(name,lat,lon,radius_m,purpose) VALUES(?,?,?,?,?) "
+        "INSERT INTO places(name,lat,lon,radius_m,purpose,group_name) VALUES(?,?,?,?,?,?) "
         "ON CONFLICT(name) DO UPDATE SET lat=excluded.lat, lon=excluded.lon, "
-        "radius_m=excluded.radius_m, purpose=excluded.purpose",
-        (name, lat, lon, radius_m, purpose),
+        "radius_m=excluded.radius_m, purpose=excluded.purpose, group_name=excluded.group_name",
+        (name, lat, lon, radius_m, purpose, group_name),
     )
     conn.commit()
-    print(f"Saved place: {name} @ {lat},{lon} r={radius_m}m")
+    group_part = f" group={group_name}" if group_name else ""
+    print(f"Saved place: {name} @ {lat},{lon} r={radius_m}m{group_part}")
     conn.close()
 
 
 def cmd_places(db_path):
     conn = sqlite3.connect(db_path)
     ensure_db(conn)
-    rows = conn.execute("SELECT id, name, lat, lon, radius_m, purpose FROM places ORDER BY name").fetchall()
+    rows = conn.execute(
+        "SELECT id, name, lat, lon, radius_m, purpose, group_name FROM places ORDER BY group_name, name"
+    ).fetchall()
     if not rows:
         print("No places.")
         return
-    for pid, name, lat, lon, radius_m, purpose in rows:
+    for pid, name, lat, lon, radius_m, purpose, group_name in rows:
         addr = reverse_geocode(lat, lon)
         addr_part = f"  {addr}" if addr else ""
-        print(f"  #{pid} {name} @ {lat:.6f},{lon:.6f} r={radius_m}m  {purpose or ''}{addr_part}")
+        group_part = f"  [{group_name}]" if group_name else ""
+        print(f"  #{pid} {name} @ {lat:.6f},{lon:.6f} r={radius_m}m{group_part}  {purpose or ''}{addr_part}")
     conn.close()
 
 
@@ -668,10 +753,14 @@ def main():
     p_add.add_argument("lon", type=float)
     p_add.add_argument("--radius", type=float, default=150)
     p_add.add_argument("--purpose", default="")
+    p_add.add_argument("--group", default=None,
+                       help="Group name — places in the same group are treated as one location")
 
     p_ignore = sub.add_parser("ignore-unknown", help="Ignore an unnamed location by index")
     p_ignore.add_argument("index", type=int)
     p_ignore.add_argument("--days", type=int, default=14)
+    p_ignore.add_argument("--permanent", action="store_true",
+                          help="Block this location permanently (never show in unnamed)")
 
     p_dump = sub.add_parser("dump", help="JSON dump")
     p_dump.add_argument("--days", type=int, default=14)
@@ -692,9 +781,9 @@ def main():
     elif args.cmd == "places":
         cmd_places(args.db)
     elif args.cmd == "add-place":
-        cmd_add_place(args.db, args.name, args.lat, args.lon, args.radius, args.purpose)
+        cmd_add_place(args.db, args.name, args.lat, args.lon, args.radius, args.purpose, args.group)
     elif args.cmd == "ignore-unknown":
-        cmd_ignore_unknown(args.db, args.index, args.days)
+        cmd_ignore_unknown(args.db, args.index, args.days, args.permanent)
     elif args.cmd == "dump":
         cmd_dump(args.db, args.days)
     elif args.cmd == "import":

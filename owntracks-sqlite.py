@@ -66,7 +66,8 @@ def ensure_db(conn):
             lon REAL NOT NULL,
             radius_m REAL NOT NULL DEFAULT 150,
             purpose TEXT,
-            group_name TEXT
+            group_name TEXT,
+            address TEXT
         );
 
         CREATE TABLE IF NOT EXISTS ignored_locations (
@@ -94,6 +95,9 @@ def ensure_db(conn):
     place_cols = {r[1] for r in conn.execute("PRAGMA table_info(places)").fetchall()}
     if "group_name" not in place_cols:
         conn.execute("ALTER TABLE places ADD COLUMN group_name TEXT")
+        conn.commit()
+    if "address" not in place_cols:
+        conn.execute("ALTER TABLE places ADD COLUMN address TEXT")
         conn.commit()
 
 
@@ -536,8 +540,12 @@ def cmd_stays(db_path, days=7):
         end = "now" if s["is_current"] else fmt_ts(s["end_ts"])
         dur = fmt_duration(s["duration_s"])
         current_tag = " (current)" if s["is_current"] else ""
-        addr = reverse_geocode(s["lat"], s["lon"])
-        addr_part = f"  ({addr})" if addr else ""
+        # Only reverse-geocode unnamed stays to avoid slow HTTP calls
+        if not s["place_name"]:
+            addr = reverse_geocode(s["lat"], s["lon"])
+            addr_part = f"  ({addr})" if addr else ""
+        else:
+            addr_part = ""
         print(f"  {start}-{end}{current_tag}  {dur:>7}  {name}{addr_part}")
 
     conn.close()
@@ -640,15 +648,18 @@ def cmd_ignore_unknown(db_path, index, days=14, permanent=False):
 def cmd_add_place(db_path, name, lat, lon, radius_m, purpose, group_name=None):
     conn = sqlite3.connect(db_path)
     ensure_db(conn)
+    address = reverse_geocode(lat, lon)
     conn.execute(
-        "INSERT INTO places(name,lat,lon,radius_m,purpose,group_name) VALUES(?,?,?,?,?,?) "
+        "INSERT INTO places(name,lat,lon,radius_m,purpose,group_name,address) VALUES(?,?,?,?,?,?,?) "
         "ON CONFLICT(name) DO UPDATE SET lat=excluded.lat, lon=excluded.lon, "
-        "radius_m=excluded.radius_m, purpose=excluded.purpose, group_name=excluded.group_name",
-        (name, lat, lon, radius_m, purpose, group_name),
+        "radius_m=excluded.radius_m, purpose=excluded.purpose, "
+        "group_name=excluded.group_name, address=excluded.address",
+        (name, lat, lon, radius_m, purpose, group_name, address),
     )
     conn.commit()
     group_part = f" group={group_name}" if group_name else ""
-    print(f"Saved place: {name} @ {lat},{lon} r={radius_m}m{group_part}")
+    addr_part = f" ({address})" if address else ""
+    print(f"Saved place: {name} @ {lat},{lon} r={radius_m}m{group_part}{addr_part}")
     conn.close()
 
 
@@ -656,15 +667,14 @@ def cmd_places(db_path):
     conn = sqlite3.connect(db_path)
     ensure_db(conn)
     rows = conn.execute(
-        "SELECT id, name, lat, lon, radius_m, purpose, group_name FROM places ORDER BY group_name, name"
+        "SELECT id, name, lat, lon, radius_m, purpose, group_name, address FROM places ORDER BY group_name, name"
     ).fetchall()
     if not rows:
         print("No places.")
         return
-    for pid, name, lat, lon, radius_m, purpose, group_name in rows:
-        addr = reverse_geocode(lat, lon)
-        addr_part = f"  {addr}" if addr else ""
+    for pid, name, lat, lon, radius_m, purpose, group_name, address in rows:
         group_part = f"  [{group_name}]" if group_name else ""
+        addr_part = f"  {address}" if address else ""
         print(f"  #{pid} {name} @ {lat:.6f},{lon:.6f} r={radius_m}m{group_part}  {purpose or ''}{addr_part}")
     conn.close()
 

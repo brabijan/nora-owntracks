@@ -327,6 +327,11 @@ def detect_transition(conn, env):
     cur_lon = current["lon"]
     cur_place_name = current["place_name"]
 
+    # Don't fire hooks for unnamed stays shorter than STAY_MIN_DURATION_S.
+    # Named places trigger immediately (we know where we are).
+    if cur_place_id is None and current["duration_s"] < STAY_MIN_DURATION_S:
+        return
+
     state = get_state(conn)
     prev_place_id = state.get("place_id")  # str(int) or None
     prev_group = state.get("group_name") or None
@@ -360,6 +365,9 @@ def detect_transition(conn, env):
         return
 
     # --- Location changed ---
+    prev_label = prev_place_name or f"{prev_lat:.4f},{prev_lon:.4f}"
+    cur_label = cur_place_name or f"{cur_lat:.4f},{cur_lon:.4f}"
+    print(f"TRANSITION {prev_label} -> {cur_label}")
 
     # Leave previous location
     if prev_lat and prev_lon:
@@ -370,10 +378,12 @@ def detect_transition(conn, env):
 
     # Arrive at new location
     if cur_place_id is not None:
+        print(f"HOOK arrive {cur_place_name}")
         run_hook(arrive_hook, "arrive", place_name=cur_place_name,
                  lat=cur_lat, lon=cur_lon)
     else:
         if not is_ignored(conn, cur_lat, cur_lon, current["start_ts"]):
+            print(f"HOOK new_unknown {cur_lat:.4f},{cur_lon:.4f}")
             run_hook(new_unknown_hook, "new_unknown",
                      lat=cur_lat, lon=cur_lon)
 
